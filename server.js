@@ -27,28 +27,19 @@ wss.on('connection', (browser) => {
   const qwen = new WebSocket(`wss://${host}/api-ws/v1/realtime?model=${encodeURIComponent(model)}`, {
     headers: { Authorization: `Bearer ${process.env.DASHSCOPE_API_KEY || ''}` }
   });
-  let started = false;
-  qwen.on('open', () => {
-    qwen.send(JSON.stringify({ header: { action: 'run-task', task_id: taskId, streaming: 'duplex' }, payload: {
-      task_group: 'aigc', task: 'multimodal-generation', function: 'generation', model: 'multimodal-dialog',
-      input: { directive: 'Start', workspace_id: process.env.DASHSCOPE_WORKSPACE_ID, app_id: process.env.DASHSCOPE_APP_ID },
-      parameters: { upstream: { type: 'AudioOnly', mode: 'duplex', audio_format: 'pcm', sample_rate: 16000, language: 'zh' }, downstream: { voice: 'longxiaochun_v2', sample_rate: 24000, audio_format: 'pcm', intermediate_text: 'transcript,dialog', incremental_response: true }, client_info: { user_id: 'ppt-mvp-user', device: { uuid: taskId } } }
-    }}));
-  });
+  qwen.on('open', () => qwen.send(JSON.stringify({ type: 'session.update', session: { modalities: ['text', 'audio'], voice: 'longanqian', input_audio_format: 'pcm16', output_audio_format: 'pcm16', input_audio_transcription: { model: 'fun-asr' }, turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 800 }, instructions: `你是中文 PPT 讲师。当前 PPT 共 ${slides.length} 页：${slides.map(s => `${s.id}. ${s.content}`).join('；')}。回答用户问题并简洁讲解。` } })));
   qwen.on('message', (data, isBinary) => {
     if (isBinary) return browser.send(data);
     const text = data.toString();
     try {
       const msg = JSON.parse(text);
-      const event = msg?.payload?.output?.event || msg?.output?.event || msg?.event;
-      if (event === 'Started') started = true;
-      send(browser, { type: 'qwen-event', event, raw: msg });
+      send(browser, { type: 'qwen-event', event: msg.type, raw: msg });
     } catch { send(browser, { type: 'qwen-text', text }); }
   });
   qwen.on('close', () => browser.close());
   qwen.on('error', (error) => send(browser, { type: 'error', message: error.message }));
   browser.on('message', (data, isBinary) => {
-    if (isBinary) { if (started && qwen.readyState === WebSocket.OPEN) qwen.send(data); return; }
+    if (isBinary) { if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.toString('base64') })); return; }
     try { const message = JSON.parse(data.toString()); qwen.send(JSON.stringify(message)); } catch { }
   });
   browser.on('close', () => { if (qwen.readyState === WebSocket.OPEN) qwen.close(); });
