@@ -23,7 +23,7 @@ app.use(express.static('public'));
 app.get('/api/slides', (_req, res) => res.json(slides));
 
 function send(ws, payload) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); }
-function promptFor(slide) { return `你是中文 PPT 讲师。当前正在展示第 ${slide.id} 页《${slide.name}》，页面内容：${slide.content}。只回答用户当前问题，先给结论再给必要解释；不要展示或朗读思考过程，不要主动提及其他页面。只有用户明确说上一页、下一页或跳转到第 N 页时才执行翻页意图。`; }
+function promptFor(slide) { return `你是中文 PPT 语音助手。当前正在展示第 ${slide.id} 页《${slide.name}》，页面内容：${slide.content}。只回应用户明确提出的请求，不要主动讲课、介绍 PPT 或扩展说明；只有用户明确要求“介绍、讲解、讲课”时才讲解当前页。回答方式要自然直接，不要固定以“结论”或总结开头；不要展示或朗读思考过程，不要主动提及其他页面。只有用户明确说上一页、下一页或跳转到第 N 页时才执行翻页意图。` }
 
 wss.on('connection', (browser) => {
   const taskId = crypto.randomUUID();
