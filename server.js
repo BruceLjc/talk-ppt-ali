@@ -23,9 +23,12 @@ app.use(express.static('public'));
 app.get('/api/slides', (_req, res) => res.json(slides));
 
 function send(ws, payload) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); }
+function promptFor(slide) { return `你是中文 PPT 讲师。当前正在展示第 ${slide.id} 页《${slide.name}》，页面内容：${slide.content}。只回答用户当前问题，先给结论再给必要解释；不要展示或朗读思考过程，不要主动提及其他页面。只有用户明确说上一页、下一页或跳转到第 N 页时才执行翻页意图。`; }
 
 wss.on('connection', (browser) => {
   const taskId = crypto.randomUUID();
+  let currentSlide = 0;
+  let activeResponse = false;
   const session = { session_id: taskId, started_at: new Date().toISOString(), ended_at: null, audio_in_bytes: 0, audio_in_frames: 0, timeline: [] };
   const logFile = path.join(logDir, `${session.started_at.replace(/[:.]/g, '-')}-${taskId}.json`);
   const record = (direction, type, data = {}) => { session.timeline.push({ at: new Date().toISOString(), direction, type, ...data }); fs.writeFileSync(logFile, JSON.stringify(session, null, 2)); };
@@ -35,12 +38,14 @@ wss.on('connection', (browser) => {
   const qwen = new WebSocket(`wss://${host}/api-ws/v1/realtime?model=${encodeURIComponent(model)}`, {
     headers: { Authorization: `Bearer ${process.env.DASHSCOPE_API_KEY || ''}` }
   });
-  qwen.on('open', () => { const message = { type: 'session.update', session: { modalities: ['text', 'audio'], voice: 'longanqian', input_audio_format: 'pcm16', output_audio_format: 'pcm16', input_audio_transcription: { model: 'fun-asr' }, turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 800 }, instructions: `你是中文 PPT 讲师。当前 PPT 共 ${slides.length} 页：${slides.map(s => `${s.id}. ${s.content}`).join('；')}。回答用户问题并简洁讲解，不输出思考过程。` } }; record('client', 'session.update', { data: message.session }); qwen.send(JSON.stringify(message)); });
+  qwen.on('open', () => { const message = { type: 'session.update', session: { modalities: ['text', 'audio'], voice: 'longanqian', input_audio_format: 'pcm16', output_audio_format: 'pcm16', input_audio_transcription: { model: 'fun-asr' }, turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 800 }, instructions: promptFor(slides[currentSlide]) } }; record('client', 'session.update', { data: message.session }); qwen.send(JSON.stringify(message)); });
   qwen.on('message', (data, isBinary) => {
     if (isBinary) return browser.send(data);
     const text = data.toString();
     try {
       const msg = JSON.parse(text);
+      if (msg.type === 'response.created') activeResponse = true;
+      if (msg.type === 'response.done') activeResponse = false;
       const safe = { ...msg }; if (safe.delta && typeof safe.delta === 'string' && safe.delta.length > 200) safe.delta = `[audio delta ${safe.delta.length} chars]`;
       record('qwen', msg.type || 'message', { data: safe });
       send(browser, { type: 'qwen-event', event: msg.type, raw: msg });
@@ -50,7 +55,7 @@ wss.on('connection', (browser) => {
   qwen.on('error', (error) => { record('qwen', 'error', { message: error.message }); send(browser, { type: 'error', message: error.message }); });
   browser.on('message', (data, isBinary) => {
     if (isBinary) { session.audio_in_bytes += data.length; session.audio_in_frames += 1; if (session.audio_in_frames % 20 === 0) record('client', 'audio.frames', { frames: session.audio_in_frames, bytes: session.audio_in_bytes }); if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.toString('base64') })); return; }
-    try { const message = JSON.parse(data.toString()); record('client', message.type || 'message', { data: message }); if (message.type !== 'ui-action') qwen.send(JSON.stringify(message)); } catch { record('client', 'invalid_message', { data: data.toString() }); }
+    try { const message = JSON.parse(data.toString()); record('client', message.type || 'message', { data: message }); if (message.type === 'ui-action') { if (message.slide_index !== undefined) { currentSlide = Math.max(0, Math.min(slides.length - 1, Number(message.slide_index))); const update = { type: 'session.update', session: { instructions: promptFor(slides[currentSlide]) } }; record('client', 'context.update', { data: { slide_index: currentSlide, slide_id: slides[currentSlide].id } }); if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(update)); } } else if (message.type === 'response.cancel') { if (activeResponse && qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } else if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } catch { record('client', 'invalid_message', { data: data.toString() }); }
   });
   browser.on('close', () => { session.ended_at = new Date().toISOString(); record('system', 'session.ended', { audio_in_bytes: session.audio_in_bytes, audio_in_frames: session.audio_in_frames }); if (qwen.readyState === WebSocket.OPEN) qwen.close(); });
 });
