@@ -38,6 +38,8 @@ wss.on('connection', (browser) => {
   const taskId = crypto.randomUUID();
   let currentSlide = 0;
   let activeResponse = false;
+  let awaitingTextResponse = false;
+  let pendingTextTurn = null;
   const session = { session_id: taskId, started_at: new Date().toISOString(), ended_at: null, current_slide: 1, audio_in_bytes: 0, audio_in_frames: 0, timeline: [] };
   const logFile = path.join(logDir, `${session.started_at.replace(/[:.]/g, '-')}-${taskId}.json`);
   const record = (direction, type, data = {}) => { session.timeline.push({ at: new Date().toISOString(), direction, type, ...data }); fs.writeFileSync(logFile, JSON.stringify(session, null, 2)); };
@@ -47,14 +49,15 @@ wss.on('connection', (browser) => {
   const qwen = new WebSocket(`wss://${host}/api-ws/v1/realtime?model=${encodeURIComponent(model)}`, {
     headers: { Authorization: `Bearer ${process.env.DASHSCOPE_API_KEY || ''}` }
   });
+  const sendTextTurn = (text) => { if (qwen.readyState !== WebSocket.OPEN) return; awaitingTextResponse = true; qwen.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })); qwen.send(JSON.stringify({ type: 'response.create', response: { modalities: ['text', 'audio'] } })); };
   qwen.on('open', () => { const message = { type: 'session.update', session: { modalities: ['text', 'audio'], voice: 'longanqian', input_audio_format: 'pcm16', output_audio_format: 'pcm16', input_audio_transcription: { model: 'fun-asr' }, turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 800, create_response: false }, instructions: promptFor(slides[currentSlide]) } }; record('client', 'session.update', { data: message.session }); qwen.send(JSON.stringify(message)); });
   qwen.on('message', (data, isBinary) => {
     if (isBinary) return browser.send(data);
     const text = data.toString();
     try {
       const msg = JSON.parse(text);
-      if (msg.type === 'response.created') activeResponse = true;
-      if (msg.type === 'response.done') activeResponse = false;
+      if (msg.type === 'response.created') { activeResponse = true; if (!awaitingTextResponse && qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'response.cancel' })); }
+      if (msg.type === 'response.done') { activeResponse = false; awaitingTextResponse = false; if (pendingTextTurn) { const textTurn = pendingTextTurn; pendingTextTurn = null; setTimeout(() => sendTextTurn(textTurn), 0); } }
       const safe = { ...msg }; if (safe.delta && typeof safe.delta === 'string' && safe.delta.length > 200) safe.delta = `[audio delta ${safe.delta.length} chars]`;
       record('qwen', msg.type || 'message', { data: safe });
       send(browser, { type: 'qwen-event', event: msg.type, raw: msg });
@@ -64,7 +67,7 @@ wss.on('connection', (browser) => {
   qwen.on('error', (error) => { record('qwen', 'error', { message: error.message }); send(browser, { type: 'error', message: error.message }); });
   browser.on('message', (data, isBinary) => {
     if (isBinary) { session.audio_in_bytes += data.length; session.audio_in_frames += 1; if (session.audio_in_frames % 20 === 0) record('client', 'audio.frames', { frames: session.audio_in_frames, bytes: session.audio_in_bytes }); if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.toString('base64') })); return; }
-    try { const message = JSON.parse(data.toString()); record('client', message.type || 'message', { data: message }); if (message.type === 'text-turn') { if (qwen.readyState === WebSocket.OPEN) { qwen.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: message.text }] } })); qwen.send(JSON.stringify({ type: 'response.create', response: { modalities: ['text', 'audio'] } })); } } else if (message.type === 'ui-action') { if (message.slide_index !== undefined) { currentSlide = Math.max(0, Math.min(slides.length - 1, Number(message.slide_index))); session.current_slide = currentSlide + 1; const update = { type: 'session.update', session: { instructions: promptFor(slides[currentSlide]) } }; record('client', 'current_page.action', { action: message.action, current_page: session.current_slide, slide_id: slides[currentSlide].id }); if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(update)); } } else if (message.type === 'response.cancel') { if (activeResponse && qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } else if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } catch { record('client', 'invalid_message', { data: data.toString() }); }
+    try { const message = JSON.parse(data.toString()); record('client', message.type || 'message', { data: message }); if (message.type === 'text-turn') { if (activeResponse || awaitingTextResponse) pendingTextTurn = message.text; else sendTextTurn(message.text); } else if (message.type === 'ui-action') { if (message.slide_index !== undefined) { currentSlide = Math.max(0, Math.min(slides.length - 1, Number(message.slide_index))); session.current_slide = currentSlide + 1; const update = { type: 'session.update', session: { instructions: promptFor(slides[currentSlide]) } }; record('client', 'current_page.action', { action: message.action, current_page: session.current_slide, slide_id: slides[currentSlide].id }); if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(update)); } } else if (message.type === 'response.cancel') { if (activeResponse && qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } else if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify(message)); } catch { record('client', 'invalid_message', { data: data.toString() }); }
   });
   browser.on('close', () => { session.ended_at = new Date().toISOString(); record('system', 'session.ended', { audio_in_bytes: session.audio_in_bytes, audio_in_frames: session.audio_in_frames }); if (qwen.readyState === WebSocket.OPEN) qwen.close(); });
 });
