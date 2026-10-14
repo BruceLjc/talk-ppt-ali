@@ -40,6 +40,10 @@ wss.on('connection', (browser) => {
   let activeResponse = false;
   let awaitingTextResponse = false;
   let pendingTextTurn = null;
+  // Qwen may emit an automatic response before final ASR arrives, even when
+  // create_response:false is requested. Never let that speculative response
+  // reach the browser audio player or chat UI.
+  const suppressedResponseIds = new Set();
   const session = { session_id: taskId, started_at: new Date().toISOString(), ended_at: null, current_slide: 1, audio_in_bytes: 0, audio_in_frames: 0, timeline: [] };
   const logFile = path.join(logDir, `${session.started_at.replace(/[:.]/g, '-')}-${taskId}.json`);
   const record = (direction, type, data = {}) => { session.timeline.push({ at: new Date().toISOString(), direction, type, ...data }); fs.writeFileSync(logFile, JSON.stringify(session, null, 2)); };
@@ -56,11 +60,20 @@ wss.on('connection', (browser) => {
     const text = data.toString();
     try {
       const msg = JSON.parse(text);
-      if (msg.type === 'response.created') { activeResponse = true; if (!awaitingTextResponse && qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'response.cancel' })); }
+      if (msg.type === 'response.created') {
+        activeResponse = true;
+        if (!awaitingTextResponse) {
+          if (msg.response?.id) suppressedResponseIds.add(msg.response.id);
+          if (qwen.readyState === WebSocket.OPEN) qwen.send(JSON.stringify({ type: 'response.cancel' }));
+        }
+      }
       if (msg.type === 'response.done') { activeResponse = false; awaitingTextResponse = false; if (pendingTextTurn) { const textTurn = pendingTextTurn; pendingTextTurn = null; setTimeout(() => sendTextTurn(textTurn), 0); } }
       const safe = { ...msg }; if (safe.delta && typeof safe.delta === 'string' && safe.delta.length > 200) safe.delta = `[audio delta ${safe.delta.length} chars]`;
       record('qwen', msg.type || 'message', { data: safe });
-      send(browser, { type: 'qwen-event', event: msg.type, raw: msg });
+      const responseId = msg.response_id || msg.response?.id;
+      const isSuppressed = responseId && suppressedResponseIds.has(responseId);
+      if (msg.type === 'response.done' && responseId) suppressedResponseIds.delete(responseId);
+      if (!isSuppressed) send(browser, { type: 'qwen-event', event: msg.type, raw: msg });
     } catch { record('qwen', 'text', { data: text }); send(browser, { type: 'qwen-text', text }); }
   });
   qwen.on('close', () => browser.close());
